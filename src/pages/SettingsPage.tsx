@@ -38,6 +38,10 @@ import type {
   AccountMeta,
   AppNotification,
   AutoRotateConfig,
+  AutoSwitchClientResult,
+  AutoSwitchConfig,
+  AutoSwitchLog,
+  AutoSwitchStatus,
   CheckinConfig,
   CheckinLog,
   GithubConfig,
@@ -349,6 +353,18 @@ const ROTATE_NUMBER_FIELDS = {
 } as const satisfies Record<string, NumberFieldSpec>;
 
 type RotateNumberKey = keyof typeof ROTATE_NUMBER_FIELDS;
+
+/** 启动自动切换的数字参数。 */
+const AUTO_SWITCH_NUMBER_FIELDS = {
+  expiry_tolerance_minutes: { label: "到期容差", min: 0, max: 1440 },
+  cooldown_minutes: { label: "切换冷却", min: 0, max: 1440 },
+  min_gap_hours: { label: "到期差异阈值", min: 0, max: 720 },
+  min_urgency_hours: { label: "到期紧迫阈值", min: 0, max: 720 },
+  min_remaining_credits: { label: "最小剩余积分", min: 0 },
+  startup_delay_seconds: { label: "启动延迟", min: 0, max: 600 },
+} as const satisfies Record<string, NumberFieldSpec>;
+
+type AutoSwitchNumberKey = keyof typeof AUTO_SWITCH_NUMBER_FIELDS;
 
 /** 自动签到配置 + 一键签到 + 日志（含自动旅行行）。 */
 function AutoCheckinCard() {
@@ -1199,6 +1215,444 @@ function AutoRotateCard() {
       </CardContent>
     </SettingsGroup>
   );
+}
+
+/**
+ * 启动时自动切换（WorkBuddy 桌面端 + VS Code 插件）。
+ *
+ * 与「CodeBuddy CLI 自动轮换」是两件独立的事：本功能**只在应用启动后执行一次**，
+ * 且目标客户端正在运行时一律跳过——不关闭客户端、不打断进行中的会话与未保存编辑。
+ */
+function AutoSwitchCard() {
+  const [cfg, setCfg] = useState<AutoSwitchConfig | null>(null);
+  const [status, setStatus] = useState<AutoSwitchStatus | null>(null);
+  /** 显示草稿的同步镜像：事件回调与异步回读都要读最新值，state 只负责渲染。 */
+  const draftRef = useRef<AutoSwitchConfig | null>(null);
+  /** 最近一次落盘的配置：即时落盘以它为提交基准。 */
+  const savedRef = useRef<AutoSwitchConfig | null>(null);
+  /** 待提交编辑：同一次交互里的连续触发合并为一份最新快照。 */
+  const pendingRef = useRef<SaveCommit<AutoSwitchConfig> | null>(null);
+  /** 提交链：串行发送，避免先发的那份（不含后一次编辑）后到达覆盖新值。 */
+  const chainRef = useRef<Promise<void>>(Promise.resolve());
+  /** 数字输入框草稿文本：只覆盖正在编辑的字段，失焦提交后清空。 */
+  const [numDraft, setNumDraft] = useState<Partial<Record<AutoSwitchNumberKey, string>>>({});
+  const [openSections, setOpenSections] = useState<string[]>([]);
+  const logsOpen = openSections.includes("logs");
+  const [logs, setLogs] = useState<AutoSwitchLog[] | null>(null);
+  const [logsError, setLogsError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    void loadConfig();
+  }, []);
+
+  // 日志懒加载：展开时才请求，每次展开重新拉取。
+  useEffect(() => {
+    if (!logsOpen) return;
+    let cancelled = false;
+    void loadLogs(() => cancelled);
+    return () => {
+      cancelled = true;
+    };
+  }, [logsOpen]);
+
+  // 自动切换在启动后延迟执行，结果经事件回传：挂载期间刷新一次状态，避免用户
+  // 正好在这一刻打开设置页却看到旧快照。
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      const stop = await listen("auto-switch-result", () => {
+        void loadConfig();
+        if (logsOpen) void loadLogs();
+      });
+      if (disposed) stop();
+      else unlisten = stop;
+    })();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+    // logsOpen 变化时不必重挂监听：回调里读的是最新引用。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function loadConfig() {
+    try {
+      const [c, s] = await Promise.all([api.getAutoSwitchConfig(), api.getAutoSwitchStatus()]);
+      savedRef.current = c;
+      updateCfg(c);
+      setStatus(s);
+    } catch (e) {
+      toast.error("启动自动切换配置加载失败", { description: api.asError(e) });
+    }
+  }
+
+  async function loadLogs(isCancelled?: () => boolean) {
+    setLogsError("");
+    try {
+      const res = await api.getAutoSwitchLogs();
+      if (!isCancelled?.()) setLogs(res.logs);
+    } catch (e) {
+      if (isCancelled?.()) return;
+      setLogs(null);
+      setLogsError(api.asError(e));
+    }
+  }
+
+  function updateCfg(next: AutoSwitchConfig) {
+    draftRef.current = next;
+    setCfg(next);
+  }
+
+  /** 即时落盘：编辑先合并成一份最新快照，再串行提交（失败回滚到已确认配置）。 */
+  function enqueueSave(
+    edits: Partial<AutoSwitchConfig>,
+    success?: SaveCommit<AutoSwitchConfig>["success"],
+  ) {
+    if (!savedRef.current) return;
+    const pending = pendingRef.current;
+    pendingRef.current = { edits: { ...pending?.edits, ...edits }, success: success ?? pending?.success };
+    chainRef.current = chainRef.current.then(flushSave);
+  }
+
+  async function flushSave() {
+    const commit = pendingRef.current;
+    pendingRef.current = null;
+    const saved = savedRef.current;
+    if (!commit || !saved) return;
+    try {
+      const next = await api.saveAutoSwitchConfig({ ...saved, ...commit.edits });
+      savedRef.current = next;
+      // 回读值只在没有更新编辑排队时才覆盖显示，避免顶掉刚做出的改动。
+      if (!pendingRef.current) updateCfg(next);
+      if (commit.success) {
+        toast.success(commit.success.title, { description: commit.success.description });
+      }
+    } catch (e) {
+      updateCfg(saved);
+      toast.error("启动自动切换设置保存失败", { description: api.asError(e) });
+    }
+  }
+
+  function onToggle(key: "enabled" | "copy_sessions" | "notify_on_skip", value: boolean) {
+    const current = draftRef.current;
+    if (!current) return;
+    updateCfg({ ...current, [key]: value });
+    const titles: Record<typeof key, [string, string]> = {
+      enabled: ["启动自动切换已开启", "启动自动切换已关闭"],
+      copy_sessions: ["已开启会话复制", "已关闭会话复制"],
+      notify_on_skip: ["已开启跳过提示", "已关闭跳过提示"],
+    };
+    enqueueSave({ [key]: value }, { title: value ? titles[key][0] : titles[key][1] });
+  }
+
+  function onNumberCommit(key: AutoSwitchNumberKey, raw: string) {
+    const current = draftRef.current;
+    const saved = savedRef.current;
+    if (!current || !saved) return;
+    const field = AUTO_SWITCH_NUMBER_FIELDS[key];
+    const value = resolveNumberInput(raw, field);
+    setNumDraft((prev) => {
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+    const next = { ...current };
+    next[key] = value ?? saved[key];
+    updateCfg(next);
+    if (value === null) {
+      toast.error(numberInputHint(field));
+      return;
+    }
+    if (value === saved[key]) return;
+    const edits: Partial<AutoSwitchConfig> = {};
+    edits[key] = value;
+    enqueueSave(edits, { title: `${field.label}已保存` });
+  }
+
+  async function runNow() {
+    setBusy(true);
+    try {
+      const res = await api.runAutoSwitch();
+      if (res.status === "disabled") {
+        toast.warning("启动自动切换未启用（请先打开上方开关）");
+      } else if (res.status === "error") {
+        const failed = describeClient(res) ?? "执行出错";
+        toast.error("自动切换执行出错", { description: failed });
+      } else {
+        toast.success(describeResult(res) ?? "本次没有需要切换的账号");
+      }
+      void loadConfig();
+      if (logsOpen) void loadLogs();
+    } catch (e) {
+      toast.error("自动切换执行失败", { description: api.asError(e) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /** 一句话概括本次结果（两个端各说一句，便于直接看出谁切了、谁被跳过）。 */
+  function describeResult(res: { clients?: Record<string, AutoSwitchClientResult | undefined> }): string | null {
+    const parts = [
+      clientSummary("WorkBuddy", res.clients?.workbuddy),
+      clientSummary("VS Code 插件", res.clients?.vscodeExt),
+    ].filter((part): part is string => part !== null);
+    return parts.length > 0 ? parts.join("；") : null;
+  }
+
+  function describeClient(res: { clients?: Record<string, AutoSwitchClientResult | undefined> }): string | null {
+    const parts = [
+      failureDetail("WorkBuddy", res.clients?.workbuddy),
+      failureDetail("VS Code 插件", res.clients?.vscodeExt),
+    ].filter((part): part is string => part !== null);
+    return parts.length > 0 ? parts.join("；") : null;
+  }
+
+  function clientSummary(name: string, result?: AutoSwitchClientResult): string | null {
+    if (!result) return null;
+    switch (result.action) {
+      case "switched":
+        return `${name} 已切到 ${result.to ?? "目标账号"}`;
+      case "error":
+        return `${name} 出错：${result.reason ?? "未知错误"}`;
+      case "inactive":
+        return `${name} 未启用`;
+      default:
+        return `${name} 已跳过（${result.reason ?? "未满足切换条件"}）`;
+    }
+  }
+
+  function failureDetail(name: string, result?: AutoSwitchClientResult): string | null {
+    return result?.action === "error" ? `${name}：${result.reason ?? "未知错误"}` : null;
+  }
+
+  function actionLabel(action: string): { text: string; tone: "success" | "warning" | "error" } {
+    switch (action) {
+      case "switched":
+        return { text: "已切换", tone: "success" };
+      case "skipped":
+        return { text: "未切换", tone: "warning" };
+      case "disabled":
+        return { text: "未启用", tone: "warning" };
+      case "error":
+        return { text: "出错", tone: "error" };
+      default:
+        return { text: action, tone: "warning" };
+    }
+  }
+
+  const lastRunAt = status?.state.lastRunAt ?? null;
+  const lastSwitchEntries = Object.entries(status?.state.lastSwitchAt ?? {});
+
+  return (
+    <SettingsGroup id="settings-auto-switch" title="启动时自动切换账号">
+      <CardContent className="space-y-0 p-0">
+        {status && (
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-border/60 bg-muted/25 px-4 py-3 text-xs text-muted-foreground sm:px-5">
+            <span>
+              上次执行：
+              <b className="text-foreground">{lastRunAt ? formatTime(lastRunAt) : "尚未执行"}</b>
+            </span>
+            {lastSwitchEntries.map(([key, ts]) => (
+              <span key={key}>
+                {clientKeyLabel(key)} 上次切换 {formatTime(ts)}
+              </span>
+            ))}
+          </div>
+        )}
+
+        <Accordion type="multiple" value={openSections} onValueChange={setOpenSections}>
+          {cfg ? (
+            <AccordionSettingsRow
+              value="params"
+              label="启用启动时自动切换"
+              description="每次启动本应用后分析所有账号积分，切到积分最快到期的账号"
+              actions={
+                <>
+                  <DemoAction>
+                    <Switch
+                      aria-label="启用启动时自动切换"
+                      checked={cfg.enabled}
+                      onCheckedChange={(value) => onToggle("enabled", value)}
+                    />
+                  </DemoAction>
+                  <DemoAction>
+                    <Button size="sm" variant="outline" onClick={runNow} disabled={busy}>
+                      {busy ? <Loader2 className="animate-spin" /> : <RefreshCw />}立即执行一次
+                    </Button>
+                  </DemoAction>
+                </>
+              }
+            >
+              <div className={INSET_PANEL}>
+                <NumberSettingRow
+                  className={PANEL_ROW}
+                  id="as-tolerance"
+                  spec={AUTO_SWITCH_NUMBER_FIELDS.expiry_tolerance_minutes}
+                  description="分钟；相差不超过它视为同时到期，此时选即将到期积分更多的账号"
+                  value={numDraft.expiry_tolerance_minutes ?? String(cfg.expiry_tolerance_minutes)}
+                  onChange={(text) => setNumDraft((prev) => ({ ...prev, expiry_tolerance_minutes: text }))}
+                  onCommit={(raw) => onNumberCommit("expiry_tolerance_minutes", raw)}
+                />
+                <NumberSettingRow
+                  className={PANEL_ROW}
+                  id="as-cooldown"
+                  spec={AUTO_SWITCH_NUMBER_FIELDS.cooldown_minutes}
+                  description="分钟"
+                  value={numDraft.cooldown_minutes ?? String(cfg.cooldown_minutes)}
+                  onChange={(text) => setNumDraft((prev) => ({ ...prev, cooldown_minutes: text }))}
+                  onCommit={(raw) => onNumberCommit("cooldown_minutes", raw)}
+                />
+                <NumberSettingRow
+                  className={PANEL_ROW}
+                  id="as-gap"
+                  spec={AUTO_SWITCH_NUMBER_FIELDS.min_gap_hours}
+                  description="小时；目标比当前早到期不足该值则不切（防抖动）"
+                  value={numDraft.min_gap_hours ?? String(cfg.min_gap_hours)}
+                  onChange={(text) => setNumDraft((prev) => ({ ...prev, min_gap_hours: text }))}
+                  onCommit={(raw) => onNumberCommit("min_gap_hours", raw)}
+                />
+                <NumberSettingRow
+                  className={PANEL_ROW}
+                  id="as-urgency"
+                  spec={AUTO_SWITCH_NUMBER_FIELDS.min_urgency_hours}
+                  description="小时；最紧迫的账号剩余超过它则本次不切"
+                  value={numDraft.min_urgency_hours ?? String(cfg.min_urgency_hours)}
+                  onChange={(text) => setNumDraft((prev) => ({ ...prev, min_urgency_hours: text }))}
+                  onCommit={(raw) => onNumberCommit("min_urgency_hours", raw)}
+                />
+                <NumberSettingRow
+                  className={PANEL_ROW}
+                  id="as-min"
+                  spec={AUTO_SWITCH_NUMBER_FIELDS.min_remaining_credits}
+                  description="低于此值时不切换"
+                  value={numDraft.min_remaining_credits ?? String(cfg.min_remaining_credits)}
+                  onChange={(text) => setNumDraft((prev) => ({ ...prev, min_remaining_credits: text }))}
+                  onCommit={(raw) => onNumberCommit("min_remaining_credits", raw)}
+                />
+                <NumberSettingRow
+                  className={cn(PANEL_ROW, "border-b-0")}
+                  id="as-delay"
+                  spec={AUTO_SWITCH_NUMBER_FIELDS.startup_delay_seconds}
+                  description="秒；启动后等这么久再执行，让登录态与网络先就绪"
+                  value={numDraft.startup_delay_seconds ?? String(cfg.startup_delay_seconds)}
+                  onChange={(text) => setNumDraft((prev) => ({ ...prev, startup_delay_seconds: text }))}
+                  onCommit={(raw) => onNumberCommit("startup_delay_seconds", raw)}
+                />
+                <div className="flex items-center justify-between gap-3 border-t border-border/50 py-2">
+                  <div className="min-w-0">
+                    <div className="text-sm">切换时复制全部会话</div>
+                    <div className="text-xs text-muted-foreground">
+                      把当前账号的全部会话复制给目标账号（源账号不受影响）
+                    </div>
+                  </div>
+                  <DemoAction>
+                    <Switch
+                      aria-label="切换时复制全部会话"
+                      checked={cfg.copy_sessions}
+                      onCheckedChange={(value) => onToggle("copy_sessions", value)}
+                    />
+                  </DemoAction>
+                </div>
+                <div className="flex items-center justify-between gap-3 py-2 pb-3">
+                  <div className="min-w-0">
+                    <div className="text-sm">跳过时提醒我</div>
+                    <div className="text-xs text-muted-foreground">
+                      客户端正在运行导致本次跳过时发一条通知（当日最多 5 条）
+                    </div>
+                  </div>
+                  <DemoAction>
+                    <Switch
+                      aria-label="跳过时提醒我"
+                      checked={cfg.notify_on_skip}
+                      onCheckedChange={(value) => onToggle("notify_on_skip", value)}
+                    />
+                  </DemoAction>
+                </div>
+                <p className="pb-2 text-[13px] leading-5 text-muted-foreground">
+                  只作用于 WorkBuddy 桌面端与 VS Code 的 CodeBuddy 插件。选择规则：到期最早者优先；到期相差不超过「到期容差」时，优先「7
+                  天内到期的积分」更多的账号；再相同按账号库顺序。
+                  <b className="text-foreground">目标客户端正在运行时一律跳过</b>
+                  ——不会关闭客户端，也不会打断进行中的会话与未保存的编辑；WorkBuddy
+                  只写认证文件，不会替你打开它。只在已有登录态的档位内选账号。
+                </p>
+              </div>
+            </AccordionSettingsRow>
+          ) : (
+            <p className="px-4 py-3 text-sm text-muted-foreground sm:px-5">加载配置中…</p>
+          )}
+
+          <AccordionSettingsRow
+            value="logs"
+            label="执行日志"
+            description="保留最近 200 条；本机明文保存，可能含账号昵称。"
+            divider={false}
+          >
+            <div className={INSET_PANEL}>
+              {logsError ? (
+                <p className="py-2 text-xs text-destructive">{logsError}</p>
+              ) : !logs ? (
+                <p className="py-2 text-xs text-muted-foreground">正在读取…</p>
+              ) : logs.length === 0 ? (
+                <p className="py-2 text-xs text-muted-foreground">暂无执行记录</p>
+              ) : (
+                <div className="max-h-64 overflow-y-auto pr-1">
+                  {logs
+                    .slice()
+                    .reverse()
+                    .map((entry, index) => {
+                      const tone = actionLabel(entry.action);
+                      const lines = [
+                        clientSummary("WorkBuddy", entry.clients?.workbuddy),
+                        clientSummary("VS Code 插件", entry.clients?.vscodeExt),
+                      ].filter((line): line is string => line !== null);
+                      return (
+                        <div
+                          key={index}
+                          className="border-b border-border/50 py-2 text-xs last:border-b-0"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span
+                              className={
+                                tone.tone === "error"
+                                  ? "text-destructive"
+                                  : tone.tone === "success"
+                                    ? "text-emerald-600"
+                                    : "text-amber-600"
+                              }
+                            >
+                              {tone.text}
+                            </span>
+                            <span className="text-muted-foreground">{formatTime(entry.ts)}</span>
+                          </div>
+                          {lines.length > 0 && (
+                            <div className="mt-1 space-y-0.5 text-muted-foreground">
+                              {lines.map((line) => (
+                                <div key={line}>{line}</div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                </div>
+              )}
+            </div>
+          </AccordionSettingsRow>
+        </Accordion>
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
+/** 冷却键 → 展示名（WorkBuddy 按档位细分）。 */
+function clientKeyLabel(key: string): string {
+  if (key === "vscodeExt") return "VS Code 插件";
+  if (key === "workbuddy:cn") return "WorkBuddy 国内版";
+  if (key === "workbuddy:ai") return "WorkBuddy 国际版";
+  return key;
 }
 
 /** 权限检测卡片：确认本 App 是否有权写入 WorkBuddy 认证文件（探针与展示路径同档位）。 */
@@ -2094,6 +2548,7 @@ export default function SettingsPage() {
         <PermissionCheckCard />
         {api.isDemoMode() ? null : <AutoCheckinCard />}
         <AutoRotateCard />
+        <AutoSwitchCard />
         <RateLimitCard />
         {api.isDesktop() && !api.isDemoMode() ? <CompanionCard /> : null}
         {api.isDesktop() || api.isDemoMode() ? <StartupCard /> : null}

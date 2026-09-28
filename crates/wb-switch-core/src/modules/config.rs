@@ -40,6 +40,12 @@ pub fn with_travel_cache_lock<T>(f: impl FnOnce() -> T) -> T {
 
 pub const ROTATE_LOG_MAX_RECORDS: usize = 200;
 
+/// 启动自动切换日志上限（每次应用启动最多一条，200 条足够回溯数月）。
+pub const AUTO_SWITCH_LOG_MAX_RECORDS: usize = 200;
+
+/// 启动自动切换「因客户端在运行而跳过」的每日提示上限。
+pub const AUTO_SWITCH_NOTIFY_DAILY_LIMIT: u32 = 5;
+
 /// 官网套餐页桌面 Chrome UA（plans-usage 捕获）。
 pub const DEFAULT_HTTP_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
 
@@ -97,6 +103,21 @@ pub fn auto_rotate_config_file() -> PathBuf {
 
 pub fn auto_rotate_logs_file() -> PathBuf {
     store_dir().join("auto_rotate_logs.json")
+}
+
+/// 启动自动切换（WorkBuddy 桌面端 + VS Code 插件）的用户配置。
+pub fn auto_switch_config_file() -> PathBuf {
+    store_dir().join("auto_switch_config.json")
+}
+
+/// 启动自动切换的运行态：上次切换时间（跨启动冷却）与通知预算。
+pub fn auto_switch_state_file() -> PathBuf {
+    store_dir().join("auto_switch_state.json")
+}
+
+/// 启动自动切换的执行日志。
+pub fn auto_switch_logs_file() -> PathBuf {
+    store_dir().join("auto_switch_logs.json")
 }
 
 pub fn workbuddy_exe_cache_file() -> PathBuf {
@@ -836,6 +857,277 @@ fn try_consume_rotate_notify_at(path: &Path, today: &str) -> bool {
     }))
     .unwrap_or_default();
     atomic_write(path, &content).is_ok()
+}
+
+// ---------------------------------------------------------------------------
+// 启动自动切换：配置 / 运行态 / 日志（WorkBuddy 桌面端 + VS Code 插件）
+// ---------------------------------------------------------------------------
+//
+// 三个文件分工：
+// - `auto_switch_config.json`：用户开关与阈值（默认关闭 total switch）；
+// - `auto_switch_state.json`：跨启动冷却依据（`lastSwitchAt`）+ 通知预算；
+// - `auto_switch_logs.json`：每次启动一条执行记录，供设置页回溯。
+//
+// 与 `rotate.rs`（CodeBuddy CLI 自动轮换）互不影响：CLI 用进程内静态量记冷却，
+// 本功能必须跨启动生效，所以冷却时间落到 `auto_switch_state.json`。
+
+/// 布尔型配置键（其余键按数值处理）。
+const AUTO_SWITCH_BOOL_KEYS: [&str; 3] = ["enabled", "copy_sessions", "notify_on_skip"];
+
+/// 数值型配置键。
+const AUTO_SWITCH_NUMBER_KEYS: [&str; 6] = [
+    "expiry_tolerance_minutes",
+    "cooldown_minutes",
+    "min_gap_hours",
+    "min_urgency_hours",
+    "min_remaining_credits",
+    "startup_delay_seconds",
+];
+
+/// 默认启动自动切换配置：**默认关闭**；阈值口径与 `rotate.rs` 保持一致
+/// （冷却 120 分钟、到期差异阈值 24 小时、紧迫阈值 72 小时、价值过滤关闭）。
+pub fn default_auto_switch_config() -> Value {
+    json!({
+        "enabled": false,
+        "expiry_tolerance_minutes": 60,
+        "cooldown_minutes": 120,
+        "min_gap_hours": 24,
+        "min_urgency_hours": 72,
+        "min_remaining_credits": 0,
+        "startup_delay_seconds": 10,
+        "copy_sessions": true,
+        "notify_on_skip": true,
+    })
+}
+
+/// 读取指定路径的启动自动切换配置（缺失/损坏时合并默认值）。
+///
+/// 与 `load_auto_switch_config` 分离只为注入路径：单测不得触碰真实 `~/.wb-switch`。
+pub fn load_auto_switch_config_at(path: &Path) -> Value {
+    let mut cfg = default_auto_switch_config();
+    if let Ok(text) = std::fs::read_to_string(path) {
+        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) {
+            for key in AUTO_SWITCH_BOOL_KEYS {
+                if let Some(value) = map.get(key).and_then(Value::as_bool) {
+                    cfg[key] = json!(value);
+                }
+            }
+            for key in AUTO_SWITCH_NUMBER_KEYS {
+                // 保留原始数值形态：整数仍读作整数（经 f64 中转会把 30 变成 30.0，
+                // 后续 `as_i64()` 就取不到了）。
+                if let Some(raw) = map.get(key) {
+                    if let Some(value) = raw.as_f64() {
+                        if value.is_finite() && value >= 0.0 {
+                            cfg[key] = raw.clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    cfg
+}
+
+/// 读取启动自动切换配置（缺失/损坏时合并默认值）。
+pub fn load_auto_switch_config() -> Value {
+    load_auto_switch_config_at(&auto_switch_config_file())
+}
+
+/// 保存启动自动切换配置到指定路径（只保留已知字段，未知键一律丢弃）。
+pub fn save_auto_switch_config_at(path: &Path, cfg: &Value) -> std::io::Result<()> {
+    let mut merged = default_auto_switch_config();
+    for key in AUTO_SWITCH_BOOL_KEYS {
+        if let Some(value) = cfg.get(key).and_then(Value::as_bool) {
+            merged[key] = json!(value);
+        }
+    }
+    for key in AUTO_SWITCH_NUMBER_KEYS {
+        // 同上：原样保留数值形态，不接受负数/NaN/Infinity。
+        if let Some(raw) = cfg.get(key) {
+            if let Some(value) = raw.as_f64() {
+                if value.is_finite() && value >= 0.0 {
+                    merged[key] = raw.clone();
+                }
+            }
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_string_pretty(&merged).unwrap_or_default();
+    atomic_write(path, &content)
+}
+
+/// 保存启动自动切换配置。
+pub fn save_auto_switch_config(cfg: &Value) -> std::io::Result<()> {
+    save_auto_switch_config_at(&auto_switch_config_file(), cfg)
+}
+
+/// 默认运行态：无任何切换记录（首次启动不施加冷却）。
+pub fn default_auto_switch_state() -> Value {
+    json!({
+        "lastSwitchAt": {},
+        "lastRunAt": Value::Null,
+        "notifyBudget": { "date": "", "count": 0 },
+    })
+}
+
+/// 归一化通知预算：日期非字符串、计数非正整数时均回落 0（宁可少发不多发）。
+fn normalize_notify_budget(value: Option<&Value>) -> Value {
+    let date = value
+        .and_then(|budget| budget.get("date"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let count = value
+        .and_then(|budget| budget.get("count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    json!({ "date": date, "count": count })
+}
+
+/// 按客户端维度归一化 `lastSwitchAt`：只保留字符串键 → 非负整数时间戳。
+fn normalize_last_switch_at(value: Option<&Value>) -> Value {
+    let mut map = serde_json::Map::new();
+    if let Some(Value::Object(raw)) = value {
+        for (key, ts) in raw {
+            if let Some(ms) = ts.as_i64() {
+                if ms > 0 {
+                    map.insert(key.clone(), json!(ms));
+                }
+            }
+        }
+    }
+    Value::Object(map)
+}
+
+/// 读取指定路径的启动自动切换运行态（缺失/损坏时回落默认值）。
+pub fn load_auto_switch_state_at(path: &Path) -> Value {
+    let mut state = default_auto_switch_state();
+    if let Ok(text) = std::fs::read_to_string(path) {
+        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) {
+            state["lastSwitchAt"] = normalize_last_switch_at(map.get("lastSwitchAt"));
+            if let Some(run_at) = map.get("lastRunAt").and_then(Value::as_i64) {
+                state["lastRunAt"] = json!(run_at);
+            }
+            state["notifyBudget"] = normalize_notify_budget(map.get("notifyBudget"));
+        }
+    }
+    state
+}
+
+/// 读取启动自动切换运行态。
+pub fn load_auto_switch_state() -> Value {
+    load_auto_switch_state_at(&auto_switch_state_file())
+}
+
+/// 保存启动自动切换运行态到指定路径（只保留已知字段）。
+pub fn save_auto_switch_state_at(path: &Path, state: &Value) -> std::io::Result<()> {
+    let merged = json!({
+        "lastSwitchAt": normalize_last_switch_at(state.get("lastSwitchAt")),
+        "lastRunAt": state.get("lastRunAt").and_then(Value::as_i64),
+        "notifyBudget": normalize_notify_budget(state.get("notifyBudget")),
+    });
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_string_pretty(&merged).unwrap_or_default();
+    atomic_write(path, &content)
+}
+
+/// 保存启动自动切换运行态。
+pub fn save_auto_switch_state(state: &Value) -> std::io::Result<()> {
+    save_auto_switch_state_at(&auto_switch_state_file(), state)
+}
+
+/// 取某客户端维度（如 `workbuddy:cn` / `vscodeExt`）的上次成功切换时间。
+///
+/// 纯读取，不落盘；无记录返回 `None`（= 该端从未切换过，不施加冷却）。
+pub fn auto_switch_last_switch_at(state: &Value, client_key: &str) -> Option<i64> {
+    state
+        .get("lastSwitchAt")
+        .and_then(|v| v.get(client_key))
+        .and_then(Value::as_i64)
+        .filter(|ms| *ms > 0)
+}
+
+static AUTO_SWITCH_STATE_LOCK: Mutex<()> = Mutex::new(());
+
+/// 记录某客户端维度的一次成功切换（读-改-写，加锁），同时刷新 `lastRunAt`。
+///
+/// 写盘失败不阻断调用方：冷却退化为本次进程内不生效，不影响切换本身。
+pub fn record_auto_switch(at_ms: i64, client_keys: &[&str]) {
+    let _guard = AUTO_SWITCH_STATE_LOCK.lock().unwrap();
+    let mut state = load_auto_switch_state();
+    for key in client_keys {
+        state["lastSwitchAt"][*key] = json!(at_ms);
+    }
+    state["lastRunAt"] = json!(at_ms);
+    let _ = save_auto_switch_state(&state);
+}
+
+/// 仅刷新 `lastRunAt`（本次跑了但没有任何端切换成功时）。
+pub fn touch_auto_switch_run(at_ms: i64) {
+    let _guard = AUTO_SWITCH_STATE_LOCK.lock().unwrap();
+    let mut state = load_auto_switch_state();
+    state["lastRunAt"] = json!(at_ms);
+    let _ = save_auto_switch_state(&state);
+}
+
+/// 读取自动切换日志。
+pub fn load_auto_switch_logs() -> Vec<Value> {
+    let f = auto_switch_logs_file();
+    if f.exists() {
+        if let Ok(text) = std::fs::read_to_string(&f) {
+            if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&text) {
+                return arr;
+            }
+        }
+    }
+    vec![]
+}
+
+/// 保存自动切换日志（保留最近 N 条，保持插入顺序）。
+pub fn save_auto_switch_logs(logs: &[Value]) -> std::io::Result<()> {
+    let mut kept: Vec<Value> = logs.to_vec();
+    if kept.len() > AUTO_SWITCH_LOG_MAX_RECORDS {
+        kept.drain(..kept.len() - AUTO_SWITCH_LOG_MAX_RECORDS);
+    }
+    std::fs::create_dir_all(store_dir())?;
+    let content = serde_json::to_string_pretty(&kept).unwrap_or_default();
+    atomic_write(&auto_switch_logs_file(), &content)
+}
+
+/// 追加一条自动切换日志。
+pub fn add_auto_switch_log(entry: &Value) {
+    let mut logs = load_auto_switch_logs();
+    logs.push(entry.clone());
+    let _ = save_auto_switch_logs(&logs);
+}
+
+/// 领取一次「客户端在运行，已跳过自动切换」的通知配额（当日上限
+/// [`AUTO_SWITCH_NOTIFY_DAILY_LIMIT`]）。
+///
+/// 预算存于 `auto_switch_state.json` 的 `notifyBudget`，跨日按本地日期清零；
+/// 读取失败/损坏按 0 计，写盘失败则**不投递**——宁可少一条通知，也不要每次启动都弹。
+pub fn try_consume_auto_switch_notify(at_ms: i64) -> bool {
+    let today = local_date(at_ms);
+    if today.is_empty() {
+        return false;
+    }
+    let _guard = AUTO_SWITCH_STATE_LOCK.lock().unwrap();
+    let mut state = load_auto_switch_state();
+    let used = state
+        .get("notifyBudget")
+        .filter(|budget| budget.get("date").and_then(Value::as_str) == Some(today.as_str()))
+        .and_then(|budget| budget.get("count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if used >= AUTO_SWITCH_NOTIFY_DAILY_LIMIT as u64 {
+        return false;
+    }
+    state["notifyBudget"] = json!({ "date": today, "count": used + 1 });
+    save_auto_switch_state(&state).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -2007,6 +2299,228 @@ mod tests {
         assert!(!try_consume_rotate_notify_at(&path, ""));
         assert!(!path.exists());
         assert!(auto_rotate_notify_file().ends_with(ROTATE_NOTIFY_FILE_NAME));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // 启动自动切换：配置 / 运行态
+    // -----------------------------------------------------------------------
+
+    fn auto_switch_temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wb-switch-auto-switch-{tag}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 默认关闭；阈值口径与 rotate 基线一致（冷却 120min / 差异 24h / 紧迫 72h）。
+    #[test]
+    fn auto_switch_defaults_are_disabled_with_rotate_baseline() {
+        let cfg = default_auto_switch_config();
+        assert_eq!(cfg.get("enabled").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            cfg.get("copy_sessions").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            cfg.get("notify_on_skip").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            cfg.get("cooldown_minutes").and_then(Value::as_i64),
+            Some(120)
+        );
+        assert_eq!(cfg.get("min_gap_hours").and_then(Value::as_i64), Some(24));
+        assert_eq!(
+            cfg.get("min_urgency_hours").and_then(Value::as_i64),
+            Some(72)
+        );
+        assert_eq!(
+            cfg.get("expiry_tolerance_minutes").and_then(Value::as_i64),
+            Some(60)
+        );
+        assert_eq!(
+            cfg.get("startup_delay_seconds").and_then(Value::as_i64),
+            Some(10)
+        );
+        assert_eq!(
+            cfg.get("min_remaining_credits").and_then(Value::as_f64),
+            Some(0.0)
+        );
+    }
+
+    /// 保存只保留白名单字段；未知键与类型不符的值一律丢弃，读取后可回环。
+    #[test]
+    fn auto_switch_config_roundtrip_keeps_known_keys_only() {
+        let dir = auto_switch_temp_dir("config");
+        let path = dir.join("auto_switch_config.json");
+
+        // 缺失 → 默认值。
+        assert_eq!(
+            load_auto_switch_config_at(&path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        save_auto_switch_config_at(
+            &path,
+            &json!({
+                "enabled": true,
+                "expiry_tolerance_minutes": 15,
+                "cooldown_minutes": 30,
+                "min_gap_hours": 6,
+                "min_urgency_hours": 12,
+                "min_remaining_credits": 250,
+                "startup_delay_seconds": 3,
+                "copy_sessions": false,
+                "notify_on_skip": false,
+                "unknownKey": "should be dropped",
+                "enabledWrongType": 1,
+            }),
+        )
+        .unwrap();
+
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("unknownKey").is_none(), "未知键必须被丢弃");
+        assert!(saved.get("enabledWrongType").is_none());
+
+        let loaded = load_auto_switch_config_at(&path);
+        assert_eq!(loaded.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            loaded
+                .get("expiry_tolerance_minutes")
+                .and_then(Value::as_i64),
+            Some(15)
+        );
+        assert_eq!(
+            loaded.get("cooldown_minutes").and_then(Value::as_i64),
+            Some(30)
+        );
+        assert_eq!(
+            loaded.get("copy_sessions").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            loaded.get("notify_on_skip").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            loaded.get("min_remaining_credits").and_then(Value::as_f64),
+            Some(250.0)
+        );
+
+        // 类型不符的值不会被写入（enabled 给数字 → 保持默认 false）。
+        save_auto_switch_config_at(&path, &json!({ "enabled": 1 })).unwrap();
+        assert_eq!(
+            load_auto_switch_config_at(&path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 配置文件损坏（非 JSON / 非对象）→ 回落默认值，不 panic。
+    #[test]
+    fn auto_switch_config_corrupt_file_falls_back_to_defaults() {
+        let dir = auto_switch_temp_dir("config-corrupt");
+        let path = dir.join("auto_switch_config.json");
+
+        for broken in ["{not json", "[]", "\"string\"", ""] {
+            std::fs::write(&path, broken).unwrap();
+            assert_eq!(
+                load_auto_switch_config_at(&path)
+                    .get("enabled")
+                    .and_then(Value::as_bool),
+                Some(false),
+                "损坏内容应回落默认值: {broken}"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 运行态：非法时间戳被过滤，正常值可读回，通知预算随保存保留。
+    #[test]
+    fn auto_switch_state_normalizes_and_preserves_notify_budget() {
+        let dir = auto_switch_temp_dir("state");
+        let path = dir.join("auto_switch_state.json");
+
+        // 缺失 → 空态：无记录即不施加冷却。
+        let fresh = load_auto_switch_state_at(&path);
+        assert_eq!(auto_switch_last_switch_at(&fresh, "workbuddy:cn"), None);
+
+        save_auto_switch_state_at(
+            &path,
+            &json!({
+                "lastSwitchAt": {
+                    "workbuddy:cn": 1_700_000_000_000i64,
+                    "vscodeExt": 1_700_000_000_001i64,
+                    "bad-string": "nope",
+                    "bad-negative": -5,
+                    "bad-zero": 0,
+                },
+                "lastRunAt": 1_700_000_000_002i64,
+                "notifyBudget": { "date": "2026-09-28", "count": 3 },
+            }),
+        )
+        .unwrap();
+
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["lastSwitchAt"].as_object().unwrap().len(),
+            2,
+            "非法时间戳（字符串/负数/0）必须被过滤"
+        );
+
+        let loaded = load_auto_switch_state_at(&path);
+        assert_eq!(
+            auto_switch_last_switch_at(&loaded, "workbuddy:cn"),
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(
+            auto_switch_last_switch_at(&loaded, "vscodeExt"),
+            Some(1_700_000_000_001)
+        );
+        assert_eq!(auto_switch_last_switch_at(&loaded, "workbuddy:ai"), None);
+        assert_eq!(
+            loaded.get("lastRunAt").and_then(Value::as_i64),
+            Some(1_700_000_000_002)
+        );
+        assert_eq!(loaded["notifyBudget"]["date"], json!("2026-09-28"));
+        assert_eq!(loaded["notifyBudget"]["count"], json!(3));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 运行态损坏 → 回落空态；通知预算字段缺失/非法 → 归零而非报错。
+    #[test]
+    fn auto_switch_state_corrupt_input_falls_back_safely() {
+        let dir = auto_switch_temp_dir("state-corrupt");
+        let path = dir.join("auto_switch_state.json");
+
+        for broken in ["{oops", "123", "null"] {
+            std::fs::write(&path, broken).unwrap();
+            let loaded = load_auto_switch_state_at(&path);
+            assert_eq!(auto_switch_last_switch_at(&loaded, "vscodeExt"), None);
+            assert_eq!(loaded["notifyBudget"]["count"], json!(0));
+        }
+
+        // 预算字段存在但类型不对。
+        std::fs::write(
+            &path,
+            r#"{"lastSwitchAt":[],"lastRunAt":"x","notifyBudget":{"date":5,"count":"many"}}"#,
+        )
+        .unwrap();
+        let loaded = load_auto_switch_state_at(&path);
+        assert_eq!(auto_switch_last_switch_at(&loaded, "vscodeExt"), None);
+        assert_eq!(loaded["notifyBudget"]["date"], json!(""));
+        assert_eq!(loaded["notifyBudget"]["count"], json!(0));
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

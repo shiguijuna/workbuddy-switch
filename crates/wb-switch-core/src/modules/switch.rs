@@ -13,6 +13,9 @@
 //!   1. 写入之前——切换开头恢复未完成写入后仍有不可安全恢复的中间产物；
 //!   2. 写入之后——本次复制/同步新留下的未完成操作（正文/数据库/组表任一阶段失败都会
 //!      保留操作记录），不能带着不一致的会话内容写认证并启动 App。
+//!
+//! 切换模式见 [`SwitchMode`]：原先单一的 `restart: bool` 无法表达「允许会话写入但不启动
+//! 客户端」，而启动时自动切换恰好需要这个组合（客户端未运行、写认证 + 复制会话、不拉起 App）。
 
 use std::collections::BTreeSet;
 
@@ -29,6 +32,56 @@ use crate::modules::variant::WbVariant;
 
 /// 切换进度回调（宿主注入，如 Tauri `app.emit` 或 HTTP 进度缓存）。
 pub type ProgressFn = Box<dyn Fn(&str) + Send + Sync>;
+
+/// 切换行为模式。
+///
+/// 拆分自原先单一的 `restart: bool`：「关进程」「允许会话写入」「切完启动」是三件独立的事，
+/// 而启动时自动切换需要「允许会话写入 + 不启动」这个原先无法表达的组合
+/// （调用方保证客户端未运行，因此无需关闭）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchMode {
+    /// 手动·重启：关闭 → 恢复 → 会话写入 → 写认证 → 启动。
+    Restart,
+    /// 手动·不重启：不关不启；携带会话写入意图时显式拒绝。
+    NoRestart,
+    /// 自动·静默写入：调用方保证客户端未运行；**允许会话写入**；写认证；**不关闭、不启动**。
+    SilentWriteWithoutLaunch,
+}
+
+impl SwitchMode {
+    /// 旧布尔入参到模式的映射（对外命令/HTTP 契约保持不变）。
+    pub fn from_restart(restart: bool) -> Self {
+        if restart {
+            Self::Restart
+        } else {
+            Self::NoRestart
+        }
+    }
+
+    /// 是否需要关闭（并在写完后重新启动）客户端。
+    pub fn closes_client(self) -> bool {
+        matches!(self, Self::Restart)
+    }
+
+    /// 是否允许会话写入（恢复未完成写入 + 复制/同步）。
+    pub fn allows_session_writes(self) -> bool {
+        !matches!(self, Self::NoRestart)
+    }
+
+    /// 写完认证后是否启动客户端。
+    pub fn launches_client(self) -> bool {
+        matches!(self, Self::Restart)
+    }
+}
+
+/// 「中止」类错误的收尾语：重启模式是暂停启动，静默模式是放弃本次写入。
+fn abort_action(mode: SwitchMode) -> &'static str {
+    if mode.launches_client() {
+        "已暂停切换与启动 WorkBuddy"
+    } else {
+        "已放弃本次静默写入"
+    }
+}
 
 /// `restart=false` 携带会话写入意图时的拒绝文案（复制/同步各自一条）。
 pub const COPY_WITHOUT_RESTART_MESSAGE: &str =
@@ -135,13 +188,14 @@ fn reject_session_writes_without_restart(
 
 /// 切换账号。
 ///
+/// `mode` 决定「关不关进程、允不允许会话写入、切完启不启动客户端」，见 [`SwitchMode`]。
 /// `copy_session_ids` 非空时按路径 B 复制勾选会话（新 id，云端可同步）；
 /// `sync_selections` 非空时把来源账号的新增内容同步到目标账号的关联会话（保留目标
 /// sessionId、标题与自定义标题）。两者共用同一把档位操作锁，顺序执行、不重复写入。
 pub fn switch_account(
     progress_fn: Option<&ProgressFn>,
     account_id: &str,
-    restart: bool,
+    mode: SwitchMode,
     share_sessions: bool,
     copy_session_ids: &[String],
     sync_selections: &[SyncSelection],
@@ -164,16 +218,21 @@ pub fn switch_account(
     let mut session_report: Option<Value> = None;
     let mut sync_report: Option<Value> = None;
     let mut recovery_report: Option<Value> = None;
-    if restart {
+    if mode.closes_client() {
         progress("正在关闭 WorkBuddy…");
         close_workbuddy(variant, 20)?;
+    }
+    // 会话写入阶段：重启模式与静默模式都要跑（静默模式由调用方保证客户端未运行，
+    // 因此无需关闭进程，但仍须先恢复未完成的会话写入）；只有手动「不重启」模式显式拒绝。
+    if mode.allows_session_writes() {
         // 关进程后先恢复未完成的会话写入：恢复成功或复制侧可安全延后重试的失败
         // 不阻断切换；同步仍未完成、拿不到锁或中间产物异常则暂停启动（design §4 / §5）。
         let recovery = match session::recover_pending_session_operations(variant) {
             Ok(report) => report,
             Err(error) => {
                 return Err(format!(
-                    "无法恢复未完成的会话写入（{error}），已暂停切换与启动 WorkBuddy；请稍后重试"
+                    "无法恢复未完成的会话写入（{error}），{}；请稍后重试",
+                    abort_action(mode)
                 ));
             }
         };
@@ -184,7 +243,8 @@ pub fn switch_account(
         if blocking {
             let detail = recovery_blocking_detail(&recovery);
             return Err(format!(
-                "检测到无法安全恢复的会话写入（{detail}），已暂停切换与启动 WorkBuddy；请先处理该会话后再试"
+                "检测到无法安全恢复的会话写入（{detail}），{}；请先处理该会话后再试",
+                abort_action(mode)
             ));
         }
         // 本次是否请求了会话写入；同时记下写入前已存在的未完成记录，供写入后比对。
@@ -210,7 +270,8 @@ pub fn switch_account(
                             || error.starts_with(LOCK_UNAVAILABLE_MESSAGE_PREFIX) =>
                     {
                         return Err(format!(
-                            "无法独占会话操作（{error}），已暂停切换与启动 WorkBuddy；请稍后重试"
+                            "无法独占会话操作（{error}），{}；请稍后重试",
+                            abort_action(mode)
                         ));
                     }
                     Err(error) => json!({"error": error}),
@@ -228,7 +289,8 @@ pub fn switch_account(
                             || error.starts_with(LOCK_UNAVAILABLE_MESSAGE_PREFIX) =>
                     {
                         return Err(format!(
-                            "无法独占会话操作（{error}），已暂停切换与启动 WorkBuddy；请稍后重试"
+                            "无法独占会话操作（{error}），{}；请稍后重试",
+                            abort_action(mode)
                         ));
                     }
                     // 同步失败不阻断切换：契约与成功路径同形，错误挂在 errors 里。
@@ -255,8 +317,9 @@ pub fn switch_account(
             );
             if !created.is_empty() {
                 return Err(format!(
-                    "本次会话写入未完成（{}），已暂停切换与启动 WorkBuddy；请重试，下次切号会先完成恢复",
-                    unfinished_writes_detail(&created)
+                    "本次会话写入未完成（{}），{}；请重试，下次切号会先完成恢复",
+                    unfinished_writes_detail(&created),
+                    abort_action(mode)
                 ));
             }
         }
@@ -272,7 +335,7 @@ pub fn switch_account(
     }
     progress("正在写入认证文件…");
     auth_file::write_account_to_auth_file(&acc, variant)?;
-    if restart {
+    if mode.launches_client() {
         progress("正在启动 WorkBuddy…");
         launch_workbuddy(variant, Some(&progress))?;
     }
@@ -514,5 +577,44 @@ mod tests {
         // 都没有写入意图：不产生任何报告（保持原有语义）。
         let (copy, sync) = reject_session_writes_without_restart(false, false);
         assert!(copy.is_none() && sync.is_none());
+    }
+
+    /// 旧布尔入参的映射必须与拆分前的语义逐位一致。
+    #[test]
+    fn switch_mode_mapping_preserves_legacy_semantics() {
+        assert_eq!(SwitchMode::from_restart(true), SwitchMode::Restart);
+        assert_eq!(SwitchMode::from_restart(false), SwitchMode::NoRestart);
+
+        // 原 restart=true：关进程 + 允许会话写入 + 启动。
+        let restart = SwitchMode::Restart;
+        assert!(restart.closes_client());
+        assert!(restart.allows_session_writes());
+        assert!(restart.launches_client());
+
+        // 原 restart=false：不关不启、拒绝会话写入。
+        let no_restart = SwitchMode::NoRestart;
+        assert!(!no_restart.closes_client());
+        assert!(!no_restart.allows_session_writes());
+        assert!(!no_restart.launches_client());
+
+        // 静默写入：本次新增的能力 —— 允许会话写入，但不关进程、不启动客户端。
+        let silent = SwitchMode::SilentWriteWithoutLaunch;
+        assert!(!silent.closes_client());
+        assert!(silent.allows_session_writes());
+        assert!(!silent.launches_client());
+    }
+
+    /// 中止话术随模式变化：重启模式说「暂停启动」，静默模式说「放弃本次写入」。
+    #[test]
+    fn abort_action_wording_follows_mode() {
+        assert_eq!(
+            abort_action(SwitchMode::Restart),
+            "已暂停切换与启动 WorkBuddy"
+        );
+        assert_eq!(abort_action(SwitchMode::NoRestart), "已放弃本次静默写入");
+        assert_eq!(
+            abort_action(SwitchMode::SilentWriteWithoutLaunch),
+            "已放弃本次静默写入"
+        );
     }
 }

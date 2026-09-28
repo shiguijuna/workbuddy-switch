@@ -37,11 +37,48 @@ pub(crate) fn deliver_rotate_notify(app: &tauri::AppHandle, result: &serde_json:
     }
 }
 
+/// 启动自动切换结果：先向前端推 `auto-switch-result`（应用内可见），再尽力投递系统通知。
+///
+/// 与 [`deliver_rotate_notify`] 同构；仅当 core 判定「值得提示」（客户端在运行导致本次
+/// 跳过、且未达当日预算）时才有 `notify` 字段，宿主不自行判断。
+/// `tray::notify_rotate_deferred` 的名字带 rotate，但实现是通用的 `{title, body}` 投递。
+pub(crate) fn deliver_auto_switch_result(app: &tauri::AppHandle, result: &serde_json::Value) {
+    #[cfg(desktop)]
+    {
+        let _ = app.emit("auto-switch-result", result.clone());
+        if let Some(notify) = result.get("notify") {
+            tray::notify_rotate_deferred(app, notify);
+        }
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = (app, result);
+    }
+}
+
 /// 后台循环：自动签到启动即核验，之后按 core 计算的下一轮延迟睡眠（未设置
 /// 签到时间段时固定 30 分钟）；自动轮换每 30 秒检查；每天一次保活；
 /// 限额 hook 信号每秒轮询一次（入账即通知前端）；限额 hook 启动时后台默认接入。
 fn spawn_background_loops(app: tauri::AppHandle) {
     let rotate_app = app.clone();
+
+    // 启动自动切换（WorkBuddy 桌面端 + VS Code 插件）：**只在启动后执行一次**，不进 loop。
+    // 延迟由 `startup_delay_seconds` 控制，让 token 刷新与网络先就绪；
+    // 客户端在运行时 core 会自行跳过，绝不关闭客户端。
+    let auto_switch_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let delay_secs = modules::config::load_auto_switch_config()
+            .get("startup_delay_seconds")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10)
+            .min(600);
+        if delay_secs > 0 {
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+        }
+        let result = modules::startup_switch::run_startup_switch_cycle().await;
+        deliver_auto_switch_result(&auto_switch_app, &result);
+    });
+
     tauri::async_runtime::spawn(async move {
         if let Err(error) = modules::config::compact_checkin_logs() {
             eprintln!("[签到] 历史日志整理失败: {error}");
@@ -248,6 +285,11 @@ pub fn run() {
             commands::rotate_status,
             commands::run_rotate,
             commands::get_rotate_logs,
+            commands::get_auto_switch_config,
+            commands::save_auto_switch_config,
+            commands::auto_switch_status,
+            commands::run_auto_switch,
+            commands::get_auto_switch_logs,
             commands::get_github_config,
             commands::save_github_config,
             commands::check_update,

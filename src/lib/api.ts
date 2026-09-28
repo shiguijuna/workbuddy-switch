@@ -5,6 +5,10 @@ import type {
   AppNotification,
   AppStatus,
   AutoRotateConfig,
+  AutoSwitchConfig,
+  AutoSwitchLog,
+  AutoSwitchResult,
+  AutoSwitchStatus,
   CodeBuddyCliInstallResult,
   CodeBuddyCliStatus,
   CodeBuddyCliSwitchResult,
@@ -59,6 +63,7 @@ const DEMO_READ_COMMANDS = new Set([
   "get_credit_expiry", "get_credit_statistics", "get_auto_checkin_config",
   "get_token_statistics",
   "get_checkin_logs", "get_auto_rotate_config", "rotate_status", "get_rotate_logs",
+  "get_auto_switch_config", "auto_switch_status", "get_auto_switch_logs",
   "get_github_config", "check_update", "get_launch_at_login_enabled", "switch_progress",
   "get_travel_status", "get_auto_travel_config", "get_rate_limits",
   "get_rate_limit_hook_status", "get_rate_limit_config",
@@ -164,6 +169,11 @@ const ROUTES: Record<string, Route> = {
   rotate_status: { method: "GET", path: "/api/rotate/status" },
   run_rotate: { method: "POST", path: "/api/rotate/run" },
   get_rotate_logs: { method: "GET", path: "/api/rotate/logs" },
+  get_auto_switch_config: { method: "GET", path: "/api/auto-switch/config" },
+  save_auto_switch_config: { method: "POST", path: "/api/auto-switch/config" },
+  auto_switch_status: { method: "GET", path: "/api/auto-switch/status" },
+  run_auto_switch: { method: "POST", path: "/api/auto-switch/run" },
+  get_auto_switch_logs: { method: "GET", path: "/api/auto-switch/logs" },
   refresh_account_token: { method: "POST", path: "/api/refresh-token" },
   get_github_config: { method: "GET", path: "/api/update/config" },
   save_github_config: { method: "POST", path: "/api/update/config" },
@@ -752,6 +762,39 @@ export function runRotate(): Promise<{
 
 export function getRotateLogs(): Promise<{ logs: RotateLog[] }> {
   return call("get_rotate_logs");
+}
+
+// ---------------------------------------------------------------------------
+// 启动自动切换（WorkBuddy 桌面端 + VS Code 插件）
+// ---------------------------------------------------------------------------
+
+export function getAutoSwitchConfig(): Promise<AutoSwitchConfig> {
+  return call("get_auto_switch_config");
+}
+
+/**
+ * 保存启动自动切换配置。
+ *
+ * 开启后后端会立刻跑一次（不阻塞本响应）；结果经 `auto-switch-result` 事件回传
+ * （webui 模式下只写日志，可再拉 `getAutoSwitchStatus()` 查看）。
+ */
+export function saveAutoSwitchConfig(config: AutoSwitchConfig): Promise<AutoSwitchConfig> {
+  return call("save_auto_switch_config", {
+    config: config as unknown as Record<string, unknown>,
+  });
+}
+
+export function getAutoSwitchStatus(): Promise<AutoSwitchStatus> {
+  return call("auto_switch_status");
+}
+
+/** 手动执行一次（仍需总开关已开启）。 */
+export function runAutoSwitch(): Promise<AutoSwitchResult> {
+  return call("run_auto_switch");
+}
+
+export function getAutoSwitchLogs(): Promise<{ logs: AutoSwitchLog[] }> {
+  return call("get_auto_switch_logs");
 }
 
 export function refreshAccountToken(accountId: string): Promise<AccountMeta> {

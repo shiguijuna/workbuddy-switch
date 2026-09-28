@@ -11,7 +11,7 @@ use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
     codebuddy_ide_session, codebuddy_ide_session_sync, credit_usage, credits, error_log,
     export_import, jetbrains, limits, notifications, oauth, process, rate_limit_events,
-    rate_limit_hook, refresh, rotate, session, switch, token_stats, travel, update,
+    rate_limit_hook, refresh, rotate, session, startup_switch, switch, token_stats, travel, update,
     variant::WbVariant, vscode_ext, vscode_session, vscode_session_sync,
 };
 
@@ -567,7 +567,8 @@ pub async fn switch_account(
     if account_id.trim().is_empty() {
         return Err("缺少 accountId".to_string());
     }
-    let restart = restart.unwrap_or(true);
+    // 对外契约仍是一个布尔（前端勾选「重启切换」），内核用 SwitchMode 表达更细的语义。
+    let switch_mode = switch::SwitchMode::from_restart(restart.unwrap_or(true));
     let share_sessions = share_sessions.unwrap_or(false);
     let copy_ids = copy_session_ids.unwrap_or_default();
     // 入参形状由 core 校验（缺 groupId / previewToken / mode 一律拒绝）；这里只做透传，
@@ -580,7 +581,7 @@ pub async fn switch_account(
         switch::switch_account(
             Some(&progress),
             &account_id,
-            restart,
+            switch_mode,
             share_sessions,
             &copy_ids,
             &sync_selections,
@@ -866,6 +867,53 @@ pub async fn run_rotate(app: tauri::AppHandle) -> Value {
 #[tauri::command]
 pub fn get_rotate_logs() -> Value {
     json!({ "logs": rotate::rotate_logs() })
+}
+
+// ---------------------------------------------------------------------------
+// 启动自动切换（WorkBuddy 桌面端 + VS Code 插件，仅启动后执行一次）
+// ---------------------------------------------------------------------------
+
+/// GET /api/auto-switch/config —— 启动自动切换配置。
+#[tauri::command]
+pub fn get_auto_switch_config() -> Value {
+    crate::modules::config::load_auto_switch_config()
+}
+
+/// POST /api/auto-switch/config —— 保存配置。开启后立刻跑一次，便于用户当场看到效果。
+///
+/// 不 await：一次切换可能关闭/写入客户端，耗时可达数十秒；结果经 `auto-switch-result`
+/// 事件回传，保存响应本身立即返回。
+#[tauri::command]
+pub fn save_auto_switch_config(app: tauri::AppHandle, config: Value) -> Result<Value, String> {
+    crate::modules::config::save_auto_switch_config(&config).map_err(|e| e.to_string())?;
+    let saved = crate::modules::config::load_auto_switch_config();
+    if saved.get("enabled").and_then(Value::as_bool) == Some(true) {
+        tauri::async_runtime::spawn(async move {
+            let result = startup_switch::run_startup_switch_cycle().await;
+            crate::deliver_auto_switch_result(&app, &result);
+        });
+    }
+    Ok(saved)
+}
+
+/// GET /api/auto-switch/status —— 配置 + 上次运行/切换时间 + 最近一条日志。
+#[tauri::command]
+pub fn auto_switch_status() -> Value {
+    startup_switch::auto_switch_status()
+}
+
+/// POST /api/auto-switch/run —— 手动执行一次（用于验证；仍需总开关已开启）。
+#[tauri::command]
+pub async fn run_auto_switch(app: tauri::AppHandle) -> Value {
+    let result = startup_switch::run_startup_switch_cycle().await;
+    crate::deliver_auto_switch_result(&app, &result);
+    result
+}
+
+/// GET /api/auto-switch/logs —— 最近执行日志。
+#[tauri::command]
+pub fn get_auto_switch_logs() -> Value {
+    json!({ "logs": crate::modules::config::load_auto_switch_logs() })
 }
 
 /// POST /api/refresh-token —— 单账号刷新 token。

@@ -21,7 +21,7 @@ use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
     codebuddy_ide_session, codebuddy_ide_session_sync, config, credit_usage, credits,
     export_import, jetbrains, limits, notifications, oauth, process, rate_limit_events,
-    rate_limit_hook, refresh, rotate, session, switch, token_stats, travel, update,
+    rate_limit_hook, refresh, rotate, session, startup_switch, switch, token_stats, travel, update,
     variant::WbVariant, vscode_ext, vscode_session, vscode_session_sync,
 };
 
@@ -171,6 +171,13 @@ pub fn router() -> Router {
         .route("/api/rotate/status", get(api_rotate_status))
         .route("/api/rotate/run", post(api_rotate_run))
         .route("/api/rotate/logs", get(api_rotate_logs))
+        .route(
+            "/api/auto-switch/config",
+            get(api_auto_switch_config).post(api_save_auto_switch_config),
+        )
+        .route("/api/auto-switch/status", get(api_auto_switch_status))
+        .route("/api/auto-switch/run", post(api_auto_switch_run))
+        .route("/api/auto-switch/logs", get(api_auto_switch_logs))
         .route("/api/refresh-token", post(api_refresh_token))
         .route("/api/update/check", get(api_update_check))
         .route(
@@ -781,11 +788,12 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
         *SWITCH_PROGRESS.lock().unwrap() = Some(msg.to_string());
     });
 
+    let switch_mode = switch::SwitchMode::from_restart(restart);
     let result = tokio::task::spawn_blocking(move || {
         switch::switch_account(
             Some(&progress),
             &account_id,
-            restart,
+            switch_mode,
             share_sessions,
             &copy_ids,
             &sync_selections,
@@ -1130,6 +1138,43 @@ async fn api_rotate_run() -> Response {
 
 async fn api_rotate_logs() -> Response {
     json_ok(json!({ "logs": rotate::rotate_logs() }))
+}
+
+// ---------------------------------------------------------------------------
+// 启动自动切换（WorkBuddy 桌面端 + VS Code 插件）
+// ---------------------------------------------------------------------------
+
+async fn api_auto_switch_config() -> Response {
+    json_ok(config::load_auto_switch_config())
+}
+
+/// 保存配置。开启后立刻跑一次（与桌面端一致）；webui 无事件通道，结果只进日志，
+/// 前端可再拉 `/api/auto-switch/status` 查看。
+async fn api_save_auto_switch_config(Json(body): Json<Value>) -> Response {
+    match config::save_auto_switch_config(&body) {
+        Ok(()) => {
+            let saved = config::load_auto_switch_config();
+            if saved.get("enabled").and_then(Value::as_bool) == Some(true) {
+                tokio::spawn(async {
+                    let _ = startup_switch::run_startup_switch_cycle().await;
+                });
+            }
+            json_ok(json!({ "ok": true, "config": saved }))
+        }
+        Err(e) => json_err(e.to_string(), StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_auto_switch_status() -> Response {
+    json_ok(startup_switch::auto_switch_status())
+}
+
+async fn api_auto_switch_run() -> Response {
+    json_ok(startup_switch::run_startup_switch_cycle().await)
+}
+
+async fn api_auto_switch_logs() -> Response {
+    json_ok(json!({ "logs": config::load_auto_switch_logs() }))
 }
 
 // ---------------------------------------------------------------------------

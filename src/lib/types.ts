@@ -422,6 +422,83 @@ export interface RotateStatus {
   lastSwitchAt: number | null;
 }
 
+/**
+ * 启动时自动切换（WorkBuddy 桌面端 + VS Code CodeBuddy 插件）配置。
+ *
+ * 与 `AutoRotateConfig`（CodeBuddy CLI 轮换）互不影响：本功能**只在应用启动后执行一次**，
+ * 且客户端正在运行时一律跳过——不关闭客户端、不打断进行中的会话与未保存编辑。
+ */
+export interface AutoSwitchConfig {
+  /** 总开关，默认关闭。 */
+  enabled: boolean;
+  /** 到期容差（分钟）：相差不超过该值视为「同时到期」，此时优先「即将到期积分更多」的账号。 */
+  expiry_tolerance_minutes: number;
+  cooldown_minutes: number;
+  min_gap_hours: number;
+  min_urgency_hours: number;
+  min_remaining_credits: number;
+  /** 启动后延迟执行秒数（等 token 与网络就绪）。 */
+  startup_delay_seconds: number;
+  /** 自动切换时把当前账号的全部会话复制给目标账号。 */
+  copy_sessions: boolean;
+  /** 因客户端正在运行而跳过时是否发系统通知。 */
+  notify_on_skip: boolean;
+}
+
+/** 单个客户端维度的执行结果；`inactive` 表示该端没有登录态，不算失败。 */
+export interface AutoSwitchClientResult {
+  action: "switched" | "skipped" | "error" | "inactive";
+  reason?: string | null;
+  from?: string | null;
+  to?: string | null;
+  sessionCopy?: unknown;
+}
+
+/** 日志里的每账号积分快照（用于事后核对选优结果）。 */
+export interface AutoSwitchAccountSnapshot {
+  name: string;
+  variant: string;
+  remaining: number;
+  expiringSoonRemaining: number;
+  soonestExpireAt: number | null;
+  valid: boolean;
+  invalidReason: string | null;
+}
+
+export interface AutoSwitchLog {
+  ts: number;
+  action: string;
+  clients?: {
+    workbuddy?: AutoSwitchClientResult;
+    vscodeExt?: AutoSwitchClientResult;
+  };
+  detail?: AutoSwitchAccountSnapshot[];
+}
+
+/** 跨启动运行态：冷却按客户端维度独立计算。 */
+export interface AutoSwitchState {
+  lastSwitchAt: Record<string, number>;
+  lastRunAt: number | null;
+}
+
+export interface AutoSwitchStatus {
+  config: AutoSwitchConfig;
+  state: AutoSwitchState;
+  lastLog: AutoSwitchLog | null;
+}
+
+/** 一次执行的结果（`run_auto_switch` 与 `auto-switch-result` 事件同形）。 */
+export interface AutoSwitchResult {
+  status: "switched" | "skipped" | "error" | "disabled";
+  reason?: string;
+  clients?: {
+    workbuddy?: AutoSwitchClientResult;
+    vscodeExt?: AutoSwitchClientResult;
+  };
+  /** 仅在「因客户端运行被跳过」且未超当日预算时出现；桌面端由宿主直接投递。 */
+  notify?: { title: string; body: string };
+}
+
 export interface CreditResource {
   packageCode: string | null;
   packageName: string | null;
